@@ -91,7 +91,11 @@ globalForEvently.__eventlyLocalStore = localStore;
 // Prefer explicit service URLs. If no API gateway is configured, fall back to
 // local dev ports instead of the port-80 gateway (which often isn't running
 // during local development).
-const API_GATEWAY_BASE = process.env.NEXT_PUBLIC_API_URL || '';
+const API_GATEWAY_BASE =
+  process.env.BACKEND_URL ||
+  process.env.NEXT_PUBLIC_BACKEND_URL ||
+  process.env.NEXT_PUBLIC_API_URL ||
+  '';
 const DEFAULT_SERVICE_BASES: Record<string, string> = {
   users: 'http://127.0.0.1:8001',
   events: 'http://127.0.0.1:8002',
@@ -750,9 +754,17 @@ function buildProxyHeaders(request: NextRequest) {
   return headers;
 }
 
+function normalizeBaseUrl(baseUrl: string, request: NextRequest) {
+  try {
+    return new URL(baseUrl).toString();
+  } catch {
+    return new URL(baseUrl, request.nextUrl.origin).toString();
+  }
+}
+
 function buildTargetUrl(baseUrl: string, request: NextRequest, segments: string[]) {
   const apiPath = `/api/${segments.join('/')}`;
-  return new URL(`${apiPath}${request.nextUrl.search}`, baseUrl);
+  return new URL(`${apiPath}${request.nextUrl.search}`, normalizeBaseUrl(baseUrl, request));
 }
 
 async function proxyRequest(request: NextRequest, context: RouteContext) {

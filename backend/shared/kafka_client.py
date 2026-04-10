@@ -16,7 +16,7 @@ load_backend_env()
 
 logger = logging.getLogger(__name__)
 
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "").strip()
 
 TOPICS = {
     "TICKET_PURCHASED": "ticket.purchased",
@@ -36,6 +36,10 @@ async def wait_for_kafka_bootstrap(service_name: str, retry_delay: float = 5.0, 
     when Kafka is not running yet. Once the broker is reachable, consumers can
     start normally.
     """
+    if not KAFKA_BOOTSTRAP:
+        logger.info("%s: Kafka is not configured. Skipping bootstrap wait.", service_name)
+        return
+
     warned = False
     server = KAFKA_BOOTSTRAP.split(",")[0].strip()
 
@@ -63,6 +67,9 @@ async def wait_for_kafka_bootstrap(service_name: str, retry_delay: float = 5.0, 
 
 
 async def get_producer() -> AIOKafkaProducer:
+    if not KAFKA_BOOTSTRAP:
+        raise RuntimeError("KAFKA_BOOTSTRAP_SERVERS is not configured")
+
     producer = AIOKafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP,
         value_serializer=lambda value: json.dumps(value).encode("utf-8"),
@@ -79,6 +86,10 @@ async def get_producer() -> AIOKafkaProducer:
 
 async def publish_event(topic: str, payload: dict, retries: int = 3):
     """Publish a message to a Kafka topic with retry logic."""
+    if not KAFKA_BOOTSTRAP:
+        logger.info("Skipping Kafka publish for topic %s because Kafka is not configured.", topic)
+        return
+
     for attempt in range(retries):
         try:
             producer = await asyncio.wait_for(get_producer(), timeout=5)
@@ -98,6 +109,9 @@ async def publish_event(topic: str, payload: dict, retries: int = 3):
 
 
 async def get_consumer(topic: str | list[str], group_id: str) -> AIOKafkaConsumer:
+    if not KAFKA_BOOTSTRAP:
+        raise RuntimeError("KAFKA_BOOTSTRAP_SERVERS is not configured")
+
     topics = [topic] if isinstance(topic, str) else list(topic)
     consumer = AIOKafkaConsumer(
         *topics,
