@@ -32,7 +32,7 @@ function getStoredUser() {
   if (!rawUser) return null;
 
   try {
-    return JSON.parse(rawUser) as { id?: string; name?: string } | null;
+    return JSON.parse(rawUser) as { id?: string; name?: string; email?: string } | null;
   } catch {
     return null;
   }
@@ -66,6 +66,10 @@ api.interceptors.request.use((config) => {
 
   if (storedUser?.name) {
     setHeader('X-Evently-User-Name', String(storedUser.name));
+  }
+
+  if (storedUser?.email) {
+    setHeader('X-Evently-User-Email', String(storedUser.email));
   }
 
   config.headers = headers;

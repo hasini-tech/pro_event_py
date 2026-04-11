@@ -1,5 +1,6 @@
 import React from 'react';
 import { Metadata } from 'next';
+import { headers } from 'next/headers';
 import { notFound } from 'next/navigation';
 import { Calendar, Clock, Copy, ExternalLink, MapPin, Share2, Users, Sparkles, Video, BookOpen } from 'lucide-react';
 import { format } from 'date-fns';
@@ -7,11 +8,29 @@ import BookingButton from './BookingButton';
 
 export const dynamic = 'force-dynamic';
 
-const FRONTEND_ORIGIN = process.env.NEXT_PUBLIC_FRONTEND_URL || 'http://localhost:3000';
+function getFrontendOrigin() {
+  const configuredOrigin = process.env.NEXT_PUBLIC_SITE_URL || process.env.NEXT_PUBLIC_FRONTEND_URL;
+  if (configuredOrigin) {
+    try {
+      return new URL(configuredOrigin).origin;
+    } catch {
+      return configuredOrigin.replace(/\/$/, '');
+    }
+  }
+
+  const requestHeaders = headers();
+  const forwardedHost = requestHeaders.get('x-forwarded-host') || requestHeaders.get('host');
+  const forwardedProto = requestHeaders.get('x-forwarded-proto') || 'https';
+  if (forwardedHost) {
+    return `${forwardedProto}://${forwardedHost}`;
+  }
+
+  return 'http://localhost:3000';
+}
 
 async function getEventDetails(slug: string) {
   try {
-    const res = await fetch(new URL(`/api/events/${slug}`, FRONTEND_ORIGIN), {
+    const res = await fetch(new URL(`/api/events/${slug}`, getFrontendOrigin()), {
       cache: 'no-store',
     });
     if (!res.ok) {
@@ -27,7 +46,7 @@ async function getEventDetails(slug: string) {
 
 async function getCommunity(slug: string) {
   try {
-    const res = await fetch(new URL(`/api/events/${slug}/community`, FRONTEND_ORIGIN), {
+    const res = await fetch(new URL(`/api/events/${slug}/community`, getFrontendOrigin()), {
       cache: 'no-store',
     });
     if (!res.ok) {
@@ -76,7 +95,7 @@ export default async function EventDetailsPage({ params }: { params: { slug: str
   }
 
   const eventDate = new Date(event.date);
-  const shareUrl = event.share_url || `${process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000'}/events/${event.slug}`;
+  const shareUrl = event.share_url || `${getFrontendOrigin()}/events/${event.slug}`;
   const googleCalendarUrl = buildGoogleCalendarUrl(event);
   const communityAttendees = community?.attendees || [];
   const speakerList = event.speakers || [];

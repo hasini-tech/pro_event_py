@@ -146,8 +146,9 @@ function buildEditForm(event: EventRecord): EditForm {
 function buildShareUrl(event: EventRecord | null) {
   if (!event) return "";
   if (event.share_url) return event.share_url;
-  const base = typeof window !== "undefined" ? window.location.origin : "http://localhost:3000";
-  return `${base.replace(/\/$/, "")}/events/${event.slug}`;
+  const configuredBase = process.env.NEXT_PUBLIC_SITE_URL || process.env.NEXT_PUBLIC_FRONTEND_URL || "";
+  const base = configuredBase.replace(/\/$/, "");
+  return base ? `${base}/events/${event.slug}` : `/events/${event.slug}`;
 }
 
 function buildInviteMessage(event: EventRecord, shareUrl: string) {

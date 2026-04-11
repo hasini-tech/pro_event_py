@@ -55,8 +55,22 @@ function clearAuth() {
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUserState] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+
+  const setUser = (nextUser: User | null) => {
+    setUserState(nextUser);
+
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    if (nextUser) {
+      localStorage.setItem('evently_user', JSON.stringify(nextUser));
+    } else {
+      localStorage.removeItem('evently_user');
+    }
+  };
 
   useEffect(() => {
     const stored = localStorage.getItem('evently_user');

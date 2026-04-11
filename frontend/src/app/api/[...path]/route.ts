@@ -63,16 +63,61 @@ type LocalCalendar = {
   created_at: string;
 };
 
+type LocalUser = {
+  id: string;
+  name: string;
+  email: string;
+  bio: string;
+  profile_image: string;
+  links: string[];
+  role: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type LocalTicket = {
+  id: string;
+  ticket_ref: string;
+  event_id: string;
+  user_id: string;
+  status: string;
+  ticket_type: string;
+  payment_status: string;
+  stripe_session_id: string;
+  qr_code: string;
+  checked_in: boolean;
+  checked_in_at: string | null;
+  created_at: string;
+  amount: number;
+};
+
+type LocalPayment = {
+  id: string;
+  user_id: string;
+  ticket_ref: string;
+  event_id: string;
+  stripe_session_id: string;
+  amount: number;
+  status: string;
+  created_at: string;
+  updated_at: string;
+};
+
 type LocalActor = {
   userId: string;
   name: string;
+  email: string;
 };
 
 type LocalStore = {
+  usersById: Map<string, LocalUser>;
   eventsById: Map<string, LocalEvent>;
   slugToId: Map<string, string>;
   calendarsById: Map<string, LocalCalendar>;
   calendarSlugToId: Map<string, string>;
+  ticketsById: Map<string, LocalTicket>;
+  ticketsByRef: Map<string, string>;
+  paymentsBySessionId: Map<string, LocalPayment>;
 };
 
 const globalForEvently = globalThis as typeof globalThis & {
@@ -81,10 +126,14 @@ const globalForEvently = globalThis as typeof globalThis & {
 
 const localStore: LocalStore =
   globalForEvently.__eventlyLocalStore ?? {
+    usersById: new Map<string, LocalUser>(),
     eventsById: new Map<string, LocalEvent>(),
     slugToId: new Map<string, string>(),
     calendarsById: new Map<string, LocalCalendar>(),
     calendarSlugToId: new Map<string, string>(),
+    ticketsById: new Map<string, LocalTicket>(),
+    ticketsByRef: new Map<string, string>(),
+    paymentsBySessionId: new Map<string, LocalPayment>(),
   };
 
 globalForEvently.__eventlyLocalStore = localStore;
@@ -97,6 +146,12 @@ const API_GATEWAY_BASE =
   process.env.NEXT_PUBLIC_BACKEND_URL ||
   process.env.NEXT_PUBLIC_API_URL ||
   '';
+const LOCAL_ADMIN_EMAILS = new Set(
+  (process.env.ADMIN_EMAILS || '')
+    .split(',')
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean)
+);
 const DEFAULT_SERVICE_BASES: Record<string, string> = {
   users: 'http://127.0.0.1:8001',
   events: 'http://127.0.0.1:8002',
@@ -114,9 +169,23 @@ const SERVICE_BASES: Record<string, string> = {
   attendees: process.env.NEXT_PUBLIC_ATTENDEE_API_URL || API_GATEWAY_BASE || DEFAULT_SERVICE_BASES.attendees,
   api: API_GATEWAY_BASE || DEFAULT_SERVICE_BASES.api,
 };
-
-const FRONTEND_BASE = process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
 const FALLBACK_JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production';
+
+function getFrontendBaseUrl(request?: NextRequest) {
+  const configuredBase =
+    process.env.NEXT_PUBLIC_SITE_URL ||
+    process.env.NEXT_PUBLIC_FRONTEND_URL ||
+    process.env.VERCEL_URL;
+
+  if (configuredBase) {
+    if (configuredBase.startsWith('http://') || configuredBase.startsWith('https://')) {
+      return configuredBase.replace(/\/$/, '');
+    }
+    return `https://${configuredBase.replace(/\/$/, '')}`;
+  }
+
+  return request?.nextUrl.origin.replace(/\/$/, '') || 'http://localhost:3000';
+}
 
 function base64UrlEncode(value: string) {
   return Buffer.from(value, 'utf8').toString('base64url');
@@ -275,9 +344,280 @@ function persistLocalCalendar(calendar: LocalCalendar) {
   return calendar;
 }
 
+function normalizeLocalLinks(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [] as string[];
+  }
+
+  return value
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean);
+}
+
+function getLocalUserById(userId: string) {
+  return localStore.usersById.get(userId) ?? null;
+}
+
+function getLocalUserByEmail(email: string) {
+  const normalizedEmail = email.trim().toLowerCase();
+  if (!normalizedEmail) {
+    return null;
+  }
+
+  for (const user of Array.from(localStore.usersById.values())) {
+    if (user.email.trim().toLowerCase() === normalizedEmail) {
+      return user;
+    }
+  }
+
+  return null;
+}
+
+function getLocalUserRole(email: string, fallback = 'user') {
+  return LOCAL_ADMIN_EMAILS.has(email.trim().toLowerCase()) ? 'admin' : fallback;
+}
+
+function displayNameFromEmail(email: string) {
+  const localPart = email.split('@', 1)[0] || '';
+  const parts = localPart
+    .replace(/[_\.]+/g, ' ')
+    .split(/\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  if (!parts.length) {
+    return 'Event Host';
+  }
+
+  return parts.slice(0, 2).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+}
+
+function persistLocalUser(user: LocalUser) {
+  localStore.usersById.set(user.id, user);
+  return user;
+}
+
+function buildLocalUserResponse(user: LocalUser) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    bio: user.bio,
+    profile_image: user.profile_image,
+    links: [...user.links],
+    role: user.role,
+    created_at: user.created_at,
+  };
+}
+
+function ensureLocalUser(
+  userId: string,
+  details: Partial<LocalUser> & { email?: string; name?: string; role?: string } = {}
+) {
+  const existing = getLocalUserById(userId);
+  const now = new Date().toISOString();
+  const email = String(details.email || existing?.email || `user-${userId.slice(0, 8)}@evently.local`)
+    .trim()
+    .toLowerCase();
+  const user = persistLocalUser({
+    id: userId,
+    name: String(details.name || existing?.name || 'Event Host'),
+    email,
+    bio: String(details.bio ?? existing?.bio ?? ''),
+    profile_image: String(details.profile_image ?? existing?.profile_image ?? ''),
+    links: normalizeLocalLinks(details.links ?? existing?.links ?? []),
+    role: details.role || existing?.role || getLocalUserRole(email, 'user'),
+    created_at: existing?.created_at || now,
+    updated_at: now,
+  });
+
+  return user;
+}
+
+function getLocalTicketById(ticketId: string) {
+  return localStore.ticketsById.get(ticketId) ?? null;
+}
+
+function getLocalTicketByRef(ticketRef: string) {
+  const ticketId = localStore.ticketsByRef.get(ticketRef);
+  if (ticketId) {
+    const ticket = localStore.ticketsById.get(ticketId);
+    if (ticket) {
+      return ticket;
+    }
+  }
+
+  for (const ticket of Array.from(localStore.ticketsById.values())) {
+    if (ticket.ticket_ref === ticketRef) {
+      return ticket;
+    }
+  }
+
+  return null;
+}
+
+function getLocalEventTickets(eventId: string) {
+  return Array.from(localStore.ticketsById.values()).filter((ticket) => ticket.event_id === eventId);
+}
+
+function persistLocalTicket(ticket: LocalTicket) {
+  localStore.ticketsById.set(ticket.id, ticket);
+  localStore.ticketsByRef.set(ticket.ticket_ref, ticket.id);
+  return ticket;
+}
+
+function persistLocalPayment(payment: LocalPayment) {
+  localStore.paymentsBySessionId.set(payment.stripe_session_id, payment);
+  return payment;
+}
+
+function buildLocalQrCode(ticketRef: string, eventId: string, userId: string) {
+  const svg = [
+    '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240">',
+    '<rect width="240" height="240" rx="28" fill="#ffffff"/>',
+    '<rect x="20" y="20" width="200" height="200" rx="22" fill="#0e7678"/>',
+    '<text x="120" y="104" text-anchor="middle" font-size="22" font-family="Arial, sans-serif" font-weight="700" fill="#ffffff">Evently</text>',
+    '<text x="120" y="136" text-anchor="middle" font-size="14" font-family="Arial, sans-serif" fill="#dff7f7">',
+    ticketRef,
+    '</text>',
+    '<text x="120" y="164" text-anchor="middle" font-size="10" font-family="Arial, sans-serif" fill="#dff7f7">',
+    `event:${eventId}`,
+    '</text>',
+    '<text x="120" y="182" text-anchor="middle" font-size="10" font-family="Arial, sans-serif" fill="#dff7f7">',
+    `user:${userId}`,
+    '</text>',
+    '</svg>',
+  ].join('');
+
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+}
+
+function refreshLocalEventMetrics(eventId: string) {
+  const event = getLocalEventById(eventId);
+  if (!event) {
+    return null;
+  }
+
+  const tickets = getLocalEventTickets(eventId);
+  const activeTickets = tickets.filter((ticket) =>
+    ['confirmed', 'pending_payment', 'pending_approval'].includes(ticket.status)
+  );
+  const confirmedTickets = tickets.filter((ticket) => ticket.status === 'confirmed');
+  const waitlistedTickets = tickets.filter((ticket) => ticket.status === 'waitlisted');
+  const checkedInTickets = tickets.filter((ticket) => ticket.checked_in);
+  const completedPaidTickets = tickets.filter(
+    (ticket) =>
+      ticket.status === 'confirmed' &&
+      ticket.ticket_type === 'paid' &&
+      ticket.payment_status === 'completed'
+  );
+
+  event.attendee_count = activeTickets.length;
+  event.confirmed_count = confirmedTickets.length;
+  event.waitlisted_count = waitlistedTickets.length;
+  event.checked_in_count = checkedInTickets.length;
+  event.ticket_sales = completedPaidTickets.length * Number(event.ticket_price || 0);
+  event.conversion_rate = tickets.length
+    ? Number(((confirmedTickets.length / tickets.length) * 100).toFixed(2))
+    : 0;
+  event.seats_left = event.max_seats > 0 ? Math.max(event.max_seats - activeTickets.length, 0) : 0;
+
+  return persistLocalEvent(event);
+}
+
+function buildLocalTicketDetail(
+  ticket: LocalTicket,
+  event?: LocalEvent | null,
+  profile?: LocalUser | null,
+) {
+  return {
+    id: ticket.id,
+    ticket_ref: ticket.ticket_ref,
+    event_id: ticket.event_id,
+    user_id: ticket.user_id,
+    status: ticket.status,
+    ticket_type: ticket.ticket_type,
+    payment_status: ticket.payment_status,
+    stripe_session_id: ticket.stripe_session_id || null,
+    qr_code: ticket.qr_code || null,
+    checked_in: ticket.checked_in,
+    checked_in_at: ticket.checked_in_at,
+    created_at: ticket.created_at,
+    event_title: event?.title || '',
+    event_slug: event?.slug || '',
+    event_date: event?.date || null,
+    event_time: event?.time || '',
+    event_location: event?.location || '',
+    event_description: event?.description || '',
+    event_cover_image: event?.cover_image || '',
+    event_is_online: Boolean(event?.is_online),
+    event_status: event?.status || '',
+    host_name: event?.host_name || '',
+    user_name: profile?.name || '',
+    user_email: profile?.email || '',
+    user_bio: profile?.bio || '',
+    user_profile_image: profile?.profile_image || '',
+    user_links: profile?.links ? [...profile.links] : [],
+  };
+}
+
+function buildLocalAttendeeResponse(
+  ticket: LocalTicket,
+  event?: LocalEvent | null,
+  profile?: LocalUser | null,
+) {
+  return {
+    id: ticket.id,
+    event_id: ticket.event_id,
+    user_id: ticket.user_id,
+    ticket_id: ticket.id,
+    ticket_ref: ticket.ticket_ref,
+    status: ticket.status,
+    ticket_type: ticket.ticket_type,
+    name: profile?.name || '',
+    bio: profile?.bio || '',
+    profile_image: profile?.profile_image || '',
+    links: profile?.links ? [...profile.links] : [],
+    checked_in: ticket.checked_in,
+    checked_in_at: ticket.checked_in_at,
+    created_at: ticket.created_at,
+    host_name: event?.host_name || '',
+  };
+}
+
+function buildLocalPaymentResponse(payment: LocalPayment) {
+  return {
+    id: payment.id,
+    user_id: payment.user_id,
+    ticket_ref: payment.ticket_ref,
+    event_id: payment.event_id,
+    stripe_session_id: payment.stripe_session_id,
+    amount: payment.amount,
+    status: payment.status,
+    created_at: payment.created_at,
+    updated_at: payment.updated_at,
+  };
+}
+
+function buildLocalAdminStats() {
+  const events = listAllLocalEvents();
+  const tickets = Array.from(localStore.ticketsById.values());
+
+  return {
+    total_events: events.length,
+    published_events: events.filter((event) => event.status === 'published').length,
+    total_tickets: tickets.length,
+    confirmed_tickets: tickets.filter((ticket) => ticket.status === 'confirmed').length,
+    waitlisted_tickets: tickets.filter((ticket) => ticket.status === 'waitlisted').length,
+    payments_completed: tickets.filter((ticket) => ticket.payment_status === 'completed').length,
+    payments_pending: tickets.filter((ticket) => ticket.payment_status !== 'completed').length,
+  };
+}
+
 function readLocalActor(request: NextRequest): LocalActor | null {
   const headerUserId = request.headers.get('x-evently-user-id')?.trim();
   const headerUserName = request.headers.get('x-evently-user-name')?.trim();
+  const headerUserEmail = request.headers.get('x-evently-user-email')?.trim();
   const decodedUserId = decodeJwtSubject(request);
   const userId = headerUserId || decodedUserId;
 
@@ -285,9 +625,12 @@ function readLocalActor(request: NextRequest): LocalActor | null {
     return null;
   }
 
+  const storedUser = getLocalUserById(userId);
+
   return {
     userId,
-    name: headerUserName || 'Personal Calendar',
+    name: headerUserName || storedUser?.name || 'Personal Calendar',
+    email: headerUserEmail || storedUser?.email || '',
   };
 }
 
@@ -475,7 +818,7 @@ function buildLocalEvent(payload: any, request: NextRequest, selectedCalendar: L
       checked_in_count: 0,
       ticket_sales: 0,
       conversion_rate: 0,
-      share_url: `${FRONTEND_BASE.replace(/\/$/, '')}/events/${slug}`,
+      share_url: `${getFrontendBaseUrl(request)}/events/${slug}`,
       created_at: now,
     },
     selectedCalendar
@@ -515,7 +858,8 @@ function updateLocalEvent(event: LocalEvent, payload: any) {
     integrations: Array.isArray(payload?.integrations) ? payload.integrations : event.integrations,
   };
 
-  return persistLocalEvent(updatedEvent);
+  const persisted = persistLocalEvent(updatedEvent);
+  return refreshLocalEventMetrics(persisted.id) ?? persisted;
 }
 
 function buildLocalOverview(request: NextRequest) {
@@ -572,12 +916,17 @@ function buildLocalCommunity(slug: string) {
     return null;
   }
 
+  const attendees = getLocalEventTickets(event.id)
+    .filter((ticket) => ticket.status === 'confirmed')
+    .slice(0, 8)
+    .map((ticket) => buildLocalAttendeeResponse(ticket, event, getLocalUserById(ticket.user_id)));
+
   return {
     event_id: event.id,
     event_slug: event.slug,
     community_enabled: event.community_enabled,
     speakers: event.speakers,
-    attendees: [],
+    attendees,
     confirmed_count: event.confirmed_count,
     waitlisted_count: event.waitlisted_count,
     checked_in_count: event.checked_in_count,
@@ -585,17 +934,18 @@ function buildLocalCommunity(slug: string) {
 }
 
 function buildLocalEventAnalytics(event: LocalEvent) {
+  const refreshed = refreshLocalEventMetrics(event.id) ?? event;
   return {
-    attendee_count: event.attendee_count,
-    confirmed_count: event.confirmed_count,
-    waitlisted_count: event.waitlisted_count,
-    checked_in_count: event.checked_in_count,
-    ticket_sales: event.ticket_sales,
-    conversion_rate: event.conversion_rate,
-    seats_left: event.seats_left,
-    max_seats: event.max_seats,
-    is_paid: event.is_paid,
-    ticket_price: event.ticket_price,
+    attendee_count: refreshed.attendee_count,
+    confirmed_count: refreshed.confirmed_count,
+    waitlisted_count: refreshed.waitlisted_count,
+    checked_in_count: refreshed.checked_in_count,
+    ticket_sales: refreshed.ticket_sales,
+    conversion_rate: refreshed.conversion_rate,
+    seats_left: refreshed.seats_left,
+    max_seats: refreshed.max_seats,
+    is_paid: refreshed.is_paid,
+    ticket_price: refreshed.ticket_price,
   };
 }
 
@@ -848,7 +1198,7 @@ async function proxyRequest(request: NextRequest, context: RouteContext) {
   }
 
   if (service === 'attendees') {
-    const response = getAttendeeFallbackResponse(request, route);
+    const response = getAttendeeFallbackResponse(request, route, requestBody);
     response.headers.set('x-evently-source', 'local-fallback');
     return response;
   }
@@ -860,7 +1210,13 @@ async function proxyRequest(request: NextRequest, context: RouteContext) {
   }
 
   if (service === 'tickets') {
-    const response = getTicketFallbackResponse(request, route);
+    const response = getTicketFallbackResponse(request, route, requestBody);
+    response.headers.set('x-evently-source', 'local-fallback');
+    return response;
+  }
+
+  if (service === 'payments') {
+    const response = getPaymentFallbackResponse(request, route, requestBody);
     response.headers.set('x-evently-source', 'local-fallback');
     return response;
   }
@@ -1044,12 +1400,12 @@ function getEventFallbackResponse(request: NextRequest, route: string, requestBo
     return NextResponse.json(buildLocalEventAnalytics(event));
   }
 
-  if (request.method === 'GET' && normalizedRoute) {
-    const event = getLocalEventByIdOrSlug(normalizedRoute);
-    if (!event) {
-      return NextResponse.json({ detail: 'Event not found' }, { status: 404 });
-    }
-    return NextResponse.json(event);
+  if (request.method === 'GET' && normalizedRoute === 'admin/all') {
+    return NextResponse.json(sortEventsByCreatedDesc(listAllLocalEvents()));
+  }
+
+  if (request.method === 'GET' && normalizedRoute === 'admin/stats') {
+    return NextResponse.json(buildLocalAdminStats());
   }
 
   if (request.method === 'GET' && normalizedRoute === 'blasts') {
@@ -1058,6 +1414,14 @@ function getEventFallbackResponse(request: NextRequest, route: string, requestBo
 
   if (request.method === 'GET' && normalizedRoute === 'invitations/suggestions') {
     return NextResponse.json({ detail: 'Event service is unavailable right now.' }, { status: 503 });
+  }
+
+  if (request.method === 'GET' && normalizedRoute) {
+    const event = getLocalEventByIdOrSlug(normalizedRoute);
+    if (!event) {
+      return NextResponse.json({ detail: 'Event not found' }, { status: 404 });
+    }
+    return NextResponse.json(event);
   }
 
   return NextResponse.json(
@@ -1070,6 +1434,7 @@ function getEventFallbackResponse(request: NextRequest, route: string, requestBo
 
 function getUserFallbackResponse(request: NextRequest, route: string, requestBody: any) {
   const normalizedRoute = route.replace(/^\/+|\/+$/g, '');
+  const actor = readLocalActor(request);
 
   if (request.method === 'POST' && normalizedRoute === 'otp/request') {
     return NextResponse.json({
@@ -1081,18 +1446,134 @@ function getUserFallbackResponse(request: NextRequest, route: string, requestBod
   }
 
   if (request.method === 'POST' && normalizedRoute === 'otp/verify') {
-    // Generate a trial JWT token for local dev if user service is down
     const userId = crypto.randomUUID();
-    const token = createFallbackToken(userId);
+    const email = String(requestBody?.email || 'dev@example.com').trim().toLowerCase();
+    const user = ensureLocalUser(userId, {
+      email,
+      name: String(requestBody?.name || displayNameFromEmail(email)),
+      role: getLocalUserRole(email, 'user'),
+    });
+    const token = createFallbackToken(userId, user.role);
     return NextResponse.json({
       token,
-      data: {
-        id: userId,
-        email: requestBody?.email || 'dev@example.com',
-        name: 'Dev User',
-        role: 'user',
-      },
+      data: buildLocalUserResponse(user),
+      success: true,
     });
+  }
+
+  if (request.method === 'POST' && normalizedRoute === 'signup') {
+    const email = String(requestBody?.email || '').trim().toLowerCase();
+    if (!email) {
+      return NextResponse.json({ detail: 'Email is required.' }, { status: 400 });
+    }
+
+    if (getLocalUserByEmail(email)) {
+      return NextResponse.json({ detail: 'User already exists with this email' }, { status: 400 });
+    }
+
+    const userId = crypto.randomUUID();
+    const user = ensureLocalUser(userId, {
+      email,
+      name: String(requestBody?.name || displayNameFromEmail(email)),
+      role: getLocalUserRole(email, 'user'),
+    });
+    const token = createFallbackToken(userId, user.role);
+    return NextResponse.json(
+      {
+        success: true,
+        token,
+        data: buildLocalUserResponse(user),
+      },
+      { status: 201 }
+    );
+  }
+
+  if (request.method === 'POST' && normalizedRoute === 'login') {
+    const email = String(requestBody?.email || '').trim().toLowerCase();
+    const existingUser = getLocalUserByEmail(email);
+    const user =
+      existingUser ||
+      ensureLocalUser(crypto.randomUUID(), {
+        email,
+        name: String(requestBody?.name || displayNameFromEmail(email || 'dev@example.com')),
+        role: getLocalUserRole(email, 'user'),
+      });
+
+    const token = createFallbackToken(user.id, user.role);
+    return NextResponse.json({
+      success: true,
+      token,
+      data: buildLocalUserResponse(user),
+    });
+  }
+
+  if (request.method === 'GET' && normalizedRoute === 'profile') {
+    if (!actor) {
+      return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
+    }
+
+    const user = ensureLocalUser(actor.userId, {
+      email: actor.email,
+      name: actor.name,
+    });
+    return NextResponse.json(buildLocalUserResponse(user));
+  }
+
+  if (request.method === 'PUT' && normalizedRoute === 'profile') {
+    if (!actor) {
+      return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
+    }
+
+    if (!requestBody || typeof requestBody !== 'object') {
+      return NextResponse.json({ detail: 'Invalid profile payload.' }, { status: 400 });
+    }
+
+    const user = ensureLocalUser(actor.userId, {
+      email: actor.email,
+      name: String(requestBody?.name || actor.name || displayNameFromEmail(actor.email || 'dev@example.com')),
+      bio: String(requestBody?.bio || ''),
+      profile_image: String(requestBody?.profile_image || ''),
+      links: normalizeLocalLinks(requestBody?.links),
+    });
+    const token = createFallbackToken(user.id, user.role);
+    return NextResponse.json({
+      success: true,
+      token,
+      data: buildLocalUserResponse(user),
+    });
+  }
+
+  if (request.method === 'GET' && normalizedRoute === 'admin/users') {
+    const adminUser = actor ? getLocalUserById(actor.userId) : null;
+    if (!adminUser || adminUser.role !== 'admin') {
+      return NextResponse.json({ detail: 'Admin access required.' }, { status: 403 });
+    }
+
+    const users = Array.from(localStore.usersById.values())
+      .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+      .map((user) => buildLocalUserResponse(user));
+    return NextResponse.json(users);
+  }
+
+  if (request.method === 'GET' && normalizedRoute === 'admin/stats') {
+    const adminUser = actor ? getLocalUserById(actor.userId) : null;
+    if (!adminUser || adminUser.role !== 'admin') {
+      return NextResponse.json({ detail: 'Admin access required.' }, { status: 403 });
+    }
+
+    return NextResponse.json({
+      total_users: localStore.usersById.size,
+      admin_users: Array.from(localStore.usersById.values()).filter((user) => user.role === 'admin').length,
+      active_users: localStore.usersById.size,
+    });
+  }
+
+  if (request.method === 'GET' && normalizedRoute) {
+    const user = getLocalUserById(normalizedRoute) || getLocalUserByEmail(normalizedRoute);
+    if (!user) {
+      return NextResponse.json({ detail: 'User not found' }, { status: 404 });
+    }
+    return NextResponse.json(buildLocalUserResponse(user));
   }
 
   return NextResponse.json(
@@ -1103,11 +1584,177 @@ function getUserFallbackResponse(request: NextRequest, route: string, requestBod
   );
 }
 
-function getTicketFallbackResponse(request: NextRequest, route: string) {
+function getTicketFallbackResponse(request: NextRequest, route: string, requestBody: any) {
   const normalizedRoute = route.replace(/^\/+|\/+$/g, '');
+  const actor = readLocalActor(request);
+
+  if (request.method === 'POST' && normalizedRoute === 'book') {
+    if (!actor) {
+      return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
+    }
+
+    const eventId = String(requestBody?.event_id || '').trim();
+    if (!eventId) {
+      return NextResponse.json({ detail: 'Event not found' }, { status: 404 });
+    }
+
+    const event = getLocalEventByIdOrSlug(eventId);
+    if (!event) {
+      return NextResponse.json({ detail: 'Event not found' }, { status: 404 });
+    }
+
+    const existingTicket = getLocalEventTickets(event.id).find(
+      (ticket) => ticket.user_id === actor.userId && !['cancelled', 'rejected'].includes(ticket.status)
+    );
+    if (existingTicket) {
+      return NextResponse.json(
+        {
+          detail: 'You already have a ticket or waitlist entry for this event',
+        },
+        { status: 400 }
+      );
+    }
+
+    const reservedCount = getLocalEventTickets(event.id).filter((ticket) =>
+      ['confirmed', 'pending_payment', 'pending_approval'].includes(ticket.status)
+    ).length;
+    const soldOut = Boolean(event.max_seats && event.max_seats > 0 && reservedCount >= event.max_seats);
+    const ticketType = event.is_paid ? 'paid' : 'free';
+    const ticketRef = `EVTLY-${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    const status = soldOut ? 'waitlisted' : event.is_paid ? 'pending_payment' : 'confirmed';
+    const paymentStatus = soldOut ? 'none' : event.is_paid ? 'pending' : 'none';
+    const profile = ensureLocalUser(actor.userId, {
+      email: actor.email,
+      name: actor.name,
+    });
+    const ticket = persistLocalTicket({
+      id: crypto.randomUUID(),
+      ticket_ref: ticketRef,
+      event_id: event.id,
+      user_id: actor.userId,
+      status,
+      ticket_type: ticketType,
+      payment_status: paymentStatus,
+      stripe_session_id: '',
+      qr_code: status === 'waitlisted' ? '' : buildLocalQrCode(ticketRef, event.id, actor.userId),
+      checked_in: false,
+      checked_in_at: null,
+      created_at: new Date().toISOString(),
+      amount: Number(event.ticket_price || 0),
+    });
+    refreshLocalEventMetrics(event.id);
+
+    return NextResponse.json(buildLocalTicketDetail(ticket, event, profile), { status: 201 });
+  }
+
+  if (request.method === 'GET' && normalizedRoute === 'my-tickets') {
+    if (!actor) {
+      return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
+    }
+
+    const tickets = Array.from(localStore.ticketsById.values())
+      .filter((ticket) => ticket.user_id === actor.userId)
+      .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+      .map((ticket) => buildLocalTicketDetail(ticket, getLocalEventById(ticket.event_id), getLocalUserById(ticket.user_id)));
+    return NextResponse.json(tickets);
+  }
+
+  if (request.method === 'GET' && normalizedRoute === 'by-ref') {
+    return NextResponse.json({ detail: 'Ticket not found' }, { status: 404 });
+  }
+
+  if (request.method === 'GET' && normalizedRoute.startsWith('by-ref/')) {
+    const ticketRef = normalizedRoute.slice('by-ref/'.length);
+    const ticket = getLocalTicketByRef(ticketRef);
+    if (!ticket) {
+      return NextResponse.json({ detail: 'Ticket not found' }, { status: 404 });
+    }
+    return NextResponse.json(
+      buildLocalTicketDetail(ticket, getLocalEventById(ticket.event_id), getLocalUserById(ticket.user_id))
+    );
+  }
 
   if (request.method === 'GET' && normalizedRoute.startsWith('event/')) {
-    return NextResponse.json([]);
+    const eventRoute = normalizedRoute.slice('event/'.length);
+    const [eventId, subRoute = ''] = eventRoute.split('/', 2);
+    const event = getLocalEventByIdOrSlug(eventId);
+    if (!event) {
+      return NextResponse.json({ detail: 'Event not found' }, { status: 404 });
+    }
+
+    const eventHost = actor ? getLocalUserById(actor.userId) : null;
+    if (!eventHost || event.host_id !== actor?.userId) {
+      return NextResponse.json({ detail: 'Not authorized to view this event' }, { status: 403 });
+    }
+
+    const tickets = getLocalEventTickets(event.id)
+      .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+      .map((ticket) => buildLocalTicketDetail(ticket, event, getLocalUserById(ticket.user_id)));
+
+    if (subRoute === 'summary') {
+      const confirmed = tickets.filter((ticket) => ticket.status === 'confirmed').length;
+      const waitlisted = tickets.filter((ticket) => ticket.status === 'waitlisted').length;
+      const checkedIn = tickets.filter((ticket) => ticket.checked_in).length;
+      const paidConfirmed = tickets.filter(
+        (ticket) => ticket.status === 'confirmed' && ticket.ticket_type === 'paid' && ticket.payment_status === 'completed'
+      ).length;
+
+      return NextResponse.json({
+        event_id: event.id,
+        title: event.title,
+        slug: event.slug,
+        confirmed,
+        waitlisted,
+        checked_in: checkedIn,
+        ticket_sales: paidConfirmed * Number(event.ticket_price || 0),
+        reserved: tickets.filter((ticket) =>
+          ['confirmed', 'pending_payment', 'pending_approval'].includes(ticket.status)
+        ).length,
+      });
+    }
+
+    if (subRoute === 'checked-in') {
+      return NextResponse.json(tickets.filter((ticket) => ticket.checked_in));
+    }
+
+    return NextResponse.json(tickets);
+  }
+
+  if (request.method === 'PUT' && normalizedRoute.startsWith('manage/')) {
+    if (!actor) {
+      return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
+    }
+
+    const ticketId = normalizedRoute.slice('manage/'.length);
+    const ticket = getLocalTicketById(ticketId);
+    if (!ticket) {
+      return NextResponse.json({ detail: 'Ticket not found' }, { status: 404 });
+    }
+
+    const event = getLocalEventById(ticket.event_id);
+    if (!event || event.host_id !== actor.userId) {
+      return NextResponse.json({ detail: 'Not authorized to manage this ticket' }, { status: 403 });
+    }
+
+    if (!requestBody || typeof requestBody !== 'object') {
+      return NextResponse.json({ detail: 'Invalid ticket payload.' }, { status: 400 });
+    }
+
+    ticket.status = String(requestBody?.status || ticket.status);
+    if (['cancelled', 'rejected'].includes(ticket.status)) {
+      ticket.checked_in = false;
+      ticket.checked_in_at = null;
+      if (ticket.payment_status === 'pending') {
+        ticket.payment_status = 'failed';
+      }
+    }
+    if (ticket.status === 'confirmed' && ticket.payment_status === 'pending') {
+      ticket.payment_status = 'completed';
+    }
+
+    persistLocalTicket(ticket);
+    refreshLocalEventMetrics(event.id);
+    return NextResponse.json(buildLocalTicketDetail(ticket, event, getLocalUserById(ticket.user_id)));
   }
 
   return NextResponse.json(
@@ -1118,11 +1765,261 @@ function getTicketFallbackResponse(request: NextRequest, route: string) {
   );
 }
 
-function getAttendeeFallbackResponse(request: NextRequest, route: string) {
+function getPaymentFallbackResponse(request: NextRequest, route: string, requestBody: any) {
   const normalizedRoute = route.replace(/^\/+|\/+$/g, '');
+  const actor = readLocalActor(request);
+
+  if (request.method === 'POST' && normalizedRoute === 'create-session') {
+    if (!actor) {
+      return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
+    }
+
+    const eventId = String(requestBody?.event_id || '').trim();
+    const ticketRef = String(requestBody?.ticket_ref || '').trim();
+    if (!eventId || !ticketRef) {
+      return NextResponse.json({ detail: 'Ticket not found' }, { status: 404 });
+    }
+
+    const event = getLocalEventByIdOrSlug(eventId);
+    const ticket = getLocalTicketByRef(ticketRef);
+    if (!event || !ticket || ticket.event_id !== event.id) {
+      return NextResponse.json({ detail: 'Ticket not found for this event' }, { status: 404 });
+    }
+    if (ticket.user_id !== actor.userId) {
+      return NextResponse.json({ detail: 'Not authorized to manage this ticket' }, { status: 403 });
+    }
+    if (ticket.status === 'waitlisted') {
+      return NextResponse.json({ detail: 'Waitlisted tickets cannot be paid until approved' }, { status: 400 });
+    }
+
+    const existingPayment = Array.from(localStore.paymentsBySessionId.values()).find(
+      (payment) => payment.ticket_ref === ticketRef && payment.user_id === actor.userId && payment.status === 'succeeded'
+    );
+    if (existingPayment) {
+      return NextResponse.json({
+        success: true,
+        url: `${getFrontendBaseUrl(request)}/payment-success?session_id=${existingPayment.stripe_session_id}`,
+      });
+    }
+
+    const sessionId = `dev_${ticketRef}_${crypto.randomUUID().slice(0, 8)}`;
+    const now = new Date().toISOString();
+    const payment = persistLocalPayment({
+      id: crypto.randomUUID(),
+      user_id: actor.userId,
+      ticket_ref: ticketRef,
+      event_id: event.id,
+      stripe_session_id: sessionId,
+      amount: Number(event.ticket_price || requestBody?.amount || 0),
+      status: 'succeeded',
+      created_at: now,
+      updated_at: now,
+    });
+
+    ticket.status = 'confirmed';
+    ticket.payment_status = 'completed';
+    ticket.ticket_type = 'paid';
+    ticket.stripe_session_id = sessionId;
+    ticket.qr_code = ticket.qr_code || buildLocalQrCode(ticket.ticket_ref, event.id, actor.userId);
+    persistLocalTicket(ticket);
+    refreshLocalEventMetrics(event.id);
+
+    return NextResponse.json({
+      success: true,
+      url: `${getFrontendBaseUrl(request)}/payment-success?session_id=${payment.stripe_session_id}`,
+    });
+  }
+
+  if (request.method === 'GET' && normalizedRoute === 'my-payments') {
+    if (!actor) {
+      return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
+    }
+
+    const payments = Array.from(localStore.paymentsBySessionId.values())
+      .filter((payment) => payment.user_id === actor.userId)
+      .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+      .map((payment) => buildLocalPaymentResponse(payment));
+    return NextResponse.json({ success: true, data: payments });
+  }
+
+  if (request.method === 'POST' && normalizedRoute.startsWith('refund/')) {
+    if (!actor) {
+      return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
+    }
+
+    const ticketRef = normalizedRoute.slice('refund/'.length);
+    const payment = Array.from(localStore.paymentsBySessionId.values()).find(
+      (entry) => entry.ticket_ref === ticketRef && entry.user_id === actor.userId
+    );
+    if (!payment) {
+      return NextResponse.json({ detail: 'Payment not found' }, { status: 404 });
+    }
+    if (payment.status === 'refunded') {
+      return NextResponse.json({ success: true, message: 'Payment already refunded' });
+    }
+
+    const ticket = getLocalTicketByRef(ticketRef);
+    const event = ticket ? getLocalEventById(ticket.event_id) : null;
+    payment.status = 'refunded';
+    payment.updated_at = new Date().toISOString();
+    persistLocalPayment(payment);
+
+    if (ticket) {
+      ticket.status = 'cancelled';
+      ticket.payment_status = 'refunded';
+      ticket.checked_in = false;
+      ticket.checked_in_at = null;
+      persistLocalTicket(ticket);
+    }
+    if (event) {
+      refreshLocalEventMetrics(event.id);
+    }
+
+    return NextResponse.json({
+      success: true,
+      message: 'Refund processed',
+      refund_id: payment.stripe_session_id,
+    });
+  }
+
+  return NextResponse.json(
+    {
+      detail: 'Payment service is unavailable right now.',
+    },
+    { status: 503 }
+  );
+}
+
+function getAttendeeFallbackResponse(request: NextRequest, route: string, requestBody: any) {
+  const normalizedRoute = route.replace(/^\/+|\/+$/g, '');
+  const actor = readLocalActor(request);
+
+  if (request.method === 'POST' && normalizedRoute === 'check-in') {
+    if (!actor) {
+      return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
+    }
+
+    if (!requestBody || typeof requestBody !== 'object') {
+      return NextResponse.json({ detail: 'Invalid check-in payload.' }, { status: 400 });
+    }
+
+    const event = getLocalEventByIdOrSlug(String(requestBody?.event_id || ''));
+    if (!event) {
+      return NextResponse.json({ detail: 'Event not found' }, { status: 404 });
+    }
+    if (event.host_id !== actor.userId) {
+      return NextResponse.json({ detail: 'Not authorized to manage this event' }, { status: 403 });
+    }
+
+    const ticket = getLocalTicketByRef(String(requestBody?.ticket_ref || ''));
+    if (!ticket || ticket.event_id !== event.id) {
+      return NextResponse.json({ detail: 'Ticket not found' }, { status: 404 });
+    }
+    if (ticket.status !== 'confirmed') {
+      return NextResponse.json({ detail: 'Only confirmed attendees can be checked in' }, { status: 400 });
+    }
+    if (ticket.checked_in) {
+      return NextResponse.json({ detail: 'Attendee already checked in' }, { status: 400 });
+    }
+
+    const now = new Date().toISOString();
+    ticket.checked_in = true;
+    ticket.checked_in_at = now;
+    persistLocalTicket(ticket);
+    refreshLocalEventMetrics(event.id);
+
+    return NextResponse.json({
+      success: true,
+      message: 'Attendee checked in successfully',
+      event_title: event.title,
+      attendee_id: ticket.id,
+      checked_in_at: now,
+    });
+  }
+
+  if (request.method === 'GET' && normalizedRoute === 'stats') {
+    const hostEvents = actor
+      ? Array.from(localStore.eventsById.values()).filter((event) => event.host_id === actor.userId)
+      : [];
+    const eventIds = new Set(hostEvents.map((event) => event.id));
+    const tickets = Array.from(localStore.ticketsById.values()).filter((ticket) => eventIds.has(ticket.event_id));
+    const confirmed = tickets.filter((ticket) => ticket.status === 'confirmed');
+    const waitlisted = tickets.filter((ticket) => ticket.status === 'waitlisted');
+    const checkedIn = tickets.filter((ticket) => ticket.checked_in);
+    const eventPriceMap = new Map(hostEvents.map((event) => [event.id, Number(event.ticket_price || 0)]));
+    const revenue = tickets.reduce((sum, ticket) => {
+      if (ticket.status !== 'confirmed' || ticket.ticket_type !== 'paid' || ticket.payment_status !== 'completed') {
+        return sum;
+      }
+      return sum + (eventPriceMap.get(ticket.event_id) || 0);
+    }, 0);
+
+    return NextResponse.json({
+      total_events: hostEvents.length,
+      total_attendees: tickets.length,
+      confirmed_attendees: confirmed.length,
+      waitlisted_attendees: waitlisted.length,
+      checked_in_count: checkedIn.length,
+      total_revenue: revenue,
+    });
+  }
+
+  if (request.method === 'GET' && normalizedRoute.startsWith('event/') && normalizedRoute.endsWith('/checked-in')) {
+    const eventId = normalizedRoute.slice('event/'.length, -'/checked-in'.length);
+    const event = getLocalEventByIdOrSlug(eventId);
+    if (!event) {
+      return NextResponse.json({ detail: 'Event not found' }, { status: 404 });
+    }
+    if (!actor || event.host_id !== actor.userId) {
+      return NextResponse.json({ detail: 'Not authorized to manage this event' }, { status: 403 });
+    }
+
+    const attendees = getLocalEventTickets(event.id)
+      .filter((ticket) => ticket.checked_in)
+      .sort((left, right) => new Date(left.checked_in_at || left.created_at).getTime() - new Date(right.checked_in_at || right.created_at).getTime())
+      .map((ticket) => buildLocalAttendeeResponse(ticket, event, getLocalUserById(ticket.user_id)));
+    return NextResponse.json(attendees);
+  }
 
   if (request.method === 'GET' && normalizedRoute.startsWith('event/')) {
-    return NextResponse.json([]);
+    const eventId = normalizedRoute.slice('event/'.length).split('/')[0];
+    const event = getLocalEventByIdOrSlug(eventId);
+    if (!event) {
+      return NextResponse.json({ detail: 'Event not found' }, { status: 404 });
+    }
+    if (!actor || event.host_id !== actor.userId) {
+      return NextResponse.json({ detail: 'Not authorized to manage this event' }, { status: 403 });
+    }
+
+    const attendees = getLocalEventTickets(event.id)
+      .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+      .map((ticket) => buildLocalAttendeeResponse(ticket, event, getLocalUserById(ticket.user_id)));
+    return NextResponse.json(attendees);
+  }
+
+  if (request.method === 'GET' && normalizedRoute.startsWith('public/event/')) {
+    const eventId = normalizedRoute.slice('public/event/'.length);
+    const event = getLocalEventByIdOrSlug(eventId);
+    if (!event) {
+      return NextResponse.json({ detail: 'Event not found' }, { status: 404 });
+    }
+
+    const allTickets = getLocalEventTickets(event.id);
+    const attendees = allTickets
+      .filter((ticket) => ticket.status === 'confirmed')
+      .slice(0, 8)
+      .map((ticket) => buildLocalAttendeeResponse(ticket, event, getLocalUserById(ticket.user_id)));
+    return NextResponse.json({
+      event_id: event.id,
+      confirmed_count: allTickets.filter((ticket) => ticket.status === 'confirmed').length,
+      waitlisted_count: allTickets.filter((ticket) => ticket.status === 'waitlisted').length,
+      checked_in_count: allTickets.filter((ticket) => ticket.checked_in).length,
+      attendees,
+    });
+  }
+
+  if (request.method === 'GET' && normalizedRoute.startsWith('internal/on-ticket-purchased')) {
+    return NextResponse.json({ ok: true });
   }
 
   return NextResponse.json(
