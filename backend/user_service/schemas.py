@@ -94,5 +94,5 @@ class OtpRequestResponse(BaseModel):
     email: str
     expires_in_seconds: int
     resend_in_seconds: int = 0
+    message: Optional[str] = None
     debug_code: Optional[str] = None
-

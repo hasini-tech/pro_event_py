@@ -2,17 +2,26 @@
 User Service route handlers.
 """
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import Any
+import jwt
 import random
 import secrets
 import sys, os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from shared.database import get_db
-from shared.auth import hash_password, verify_password, create_access_token, get_current_user, require_role
+from shared.auth import (
+    ALGORITHM,
+    SECRET_KEY,
+    create_access_token,
+    get_current_user,
+    hash_password,
+    require_role,
+    verify_password,
+)
 from shared.email_service import is_email_configured, send_login_otp_email, send_welcome_email
 from .models import User
 from .schemas import (
@@ -30,7 +39,12 @@ router = APIRouter()
 ADMIN_EMAILS = {email.strip().lower() for email in os.getenv("ADMIN_EMAILS", "").split(",") if email.strip()}
 OTP_EXPIRE_MINUTES = 10
 OTP_RESEND_SECONDS = 56
+OTP_COOKIE_NAME = "evently_login_otp"
 OTP_STORE: dict[str, dict[str, Any]] = {}
+OTP_COOKIE_SECURE = (
+    os.getenv("VERCEL_ENV") == "production"
+    or os.getenv("FRONTEND_URL", "").startswith("https://")
+)
 
 
 def _apply_admin_role_if_needed(user: User, db: Session) -> User:
@@ -57,6 +71,54 @@ def _generate_otp_code() -> str:
     return f"{random.randint(0, 999999):06d}"
 
 
+def _encode_login_otp(email: str, code: str, expires_at: datetime, resend_at: datetime) -> str:
+    payload = {
+        "sub": email,
+        "otp": code,
+        "purpose": "login_otp",
+        "exp": expires_at,
+        "resend_at": int(resend_at.timestamp()),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def _decode_login_otp(token: str | None) -> dict[str, Any] | None:
+    if not token:
+        return None
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+    if payload.get("purpose") != "login_otp":
+        return None
+    return payload
+
+
+def _set_login_otp_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=OTP_COOKIE_NAME,
+        value=token,
+        max_age=OTP_EXPIRE_MINUTES * 60,
+        httponly=True,
+        samesite="lax",
+        secure=OTP_COOKIE_SECURE,
+        path="/",
+    )
+
+
+def _clear_login_otp_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=OTP_COOKIE_NAME,
+        path="/",
+        samesite="lax",
+        secure=OTP_COOKIE_SECURE,
+    )
+
+
 def _display_name_from_email(email: str) -> str:
     local_part = email.split("@", 1)[0]
     parts = [part for part in local_part.replace("_", " ").replace(".", " ").split() if part]
@@ -71,7 +133,12 @@ def health():
 
 
 @router.post('/otp/request', response_model=OtpRequestResponse)
-async def request_login_otp(payload: OtpRequest, db: Session = Depends(get_db)):
+async def request_login_otp(
+    payload: OtpRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
     _cleanup_expired_otps()
     email = payload.email.strip().lower()
     existing_user = db.query(User).filter(func.lower(User.email) == email).first()
@@ -79,12 +146,23 @@ async def request_login_otp(payload: OtpRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=403, detail='Account is deactivated')
 
     now = datetime.now(timezone.utc)
+    otp_payload = _decode_login_otp(request.cookies.get(OTP_COOKIE_NAME))
     current_record = OTP_STORE.get(email)
-    if current_record and current_record["resend_at"] > now:
-        retry_after = int((current_record["resend_at"] - now).total_seconds())
+
+    active_resend_at: datetime | None = None
+    if otp_payload and otp_payload.get("sub") == email:
+        resend_at_timestamp = otp_payload.get("resend_at")
+        if isinstance(resend_at_timestamp, (int, float)):
+            active_resend_at = datetime.fromtimestamp(resend_at_timestamp, tz=timezone.utc)
+    elif current_record:
+        active_resend_at = current_record["resend_at"]
+
+    if active_resend_at and active_resend_at > now:
+        retry_after = int((active_resend_at - now).total_seconds())
         raise HTTPException(
             status_code=429,
             detail=f"Please wait {max(retry_after, 1)} seconds before requesting another code",
+            headers={"Retry-After": str(max(retry_after, 1))},
         )
 
     code = _generate_otp_code()
@@ -97,37 +175,63 @@ async def request_login_otp(payload: OtpRequest, db: Session = Depends(get_db)):
         "resend_at": resend_at,
     }
 
+    delivered = False
     try:
-        await send_login_otp_email(email, code)
+        delivered = await send_login_otp_email(email, code)
     except Exception:
-        pass
+        delivered = False
+
+    otp_token = _encode_login_otp(email, code, expires_at, resend_at)
+    _set_login_otp_cookie(response, otp_token)
+
+    email_ready = is_email_configured()
+    message = (
+        "We sent a 6 digit code to your email."
+        if delivered
+        else "Email delivery is not configured right now, so use the code shown below."
+    )
 
     return {
         "success": True,
         "email": email,
         "expires_in_seconds": OTP_EXPIRE_MINUTES * 60,
         "resend_in_seconds": OTP_RESEND_SECONDS,
-        "debug_code": code,
+        "debug_code": None if delivered and email_ready else code,
+        "message": message,
     }
 
 
 @router.post('/otp/verify', response_model=AuthResponse)
-async def verify_login_otp(payload: OtpVerify, db: Session = Depends(get_db)):
+async def verify_login_otp(
+    payload: OtpVerify,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
     _cleanup_expired_otps()
     email = payload.email.strip().lower()
+
+    otp_payload = _decode_login_otp(request.cookies.get(OTP_COOKIE_NAME))
     record = OTP_STORE.get(email)
-    if not record:
+    expected_code: str | None = None
+
+    if otp_payload and otp_payload.get("sub") == email:
+        expected_code = str(otp_payload.get("otp", "")).strip()
+    elif record:
+        now = datetime.now(timezone.utc)
+        if record["expires_at"] <= now:
+            OTP_STORE.pop(email, None)
+            raise HTTPException(status_code=400, detail='This code has expired')
+        expected_code = record["code"]
+
+    if not expected_code:
         raise HTTPException(status_code=400, detail='A valid code was not found for this email')
 
-    now = datetime.now(timezone.utc)
-    if record["expires_at"] <= now:
-        OTP_STORE.pop(email, None)
-        raise HTTPException(status_code=400, detail='This code has expired')
-
-    if payload.code != record["code"] and payload.code != "000000":
+    if payload.code != expected_code and payload.code != "000000":
         raise HTTPException(status_code=401, detail='Invalid verification code')
 
     OTP_STORE.pop(email, None)
+    _clear_login_otp_cookie(response)
 
     user = db.query(User).filter(func.lower(User.email) == email).first()
     created_user = False

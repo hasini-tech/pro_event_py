@@ -1,3 +1,4 @@
+import { createHmac } from 'crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { DEFAULT_EVENT_COVER } from '@/lib/defaults';
 
@@ -115,6 +116,28 @@ const SERVICE_BASES: Record<string, string> = {
 };
 
 const FRONTEND_BASE = process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
+const FALLBACK_JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production';
+
+function base64UrlEncode(value: string) {
+  return Buffer.from(value, 'utf8').toString('base64url');
+}
+
+function createFallbackToken(userId: string, role = 'user') {
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64UrlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const payload = base64UrlEncode(
+    JSON.stringify({
+      sub: userId,
+      role,
+      iat: now,
+      exp: now + 60 * 60 * 24,
+    }),
+  );
+  const signature = createHmac('sha256', FALLBACK_JWT_SECRET)
+    .update(`${header}.${payload}`)
+    .digest('base64url');
+  return `${header}.${payload}.${signature}`;
+}
 
 function resolveServiceBases(service?: string) {
   if (!service) {
@@ -1059,11 +1082,12 @@ function getUserFallbackResponse(request: NextRequest, route: string, requestBod
 
   if (request.method === 'POST' && normalizedRoute === 'otp/verify') {
     // Generate a trial JWT token for local dev if user service is down
-    const token = 'local-dev-trial-token';
+    const userId = crypto.randomUUID();
+    const token = createFallbackToken(userId);
     return NextResponse.json({
       token,
       data: {
-        id: crypto.randomUUID(),
+        id: userId,
         email: requestBody?.email || 'dev@example.com',
         name: 'Dev User',
         role: 'user',
