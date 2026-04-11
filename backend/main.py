@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import sys
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -40,39 +39,50 @@ if BACKEND_URL:
 os.environ.setdefault("KAFKA_BOOTSTRAP_SERVERS", "")
 
 
-def add_cors(app: FastAPI) -> None:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[FRONTEND_ORIGIN, "http://127.0.0.1:3000"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+app = FastAPI(
+    title="Evently Backend",
+    description="Aggregated FastAPI backend for Vercel deployments.",
+    version="1.0.0",
+)
+
+# Export the common Python runtime names explicitly so Vercel can detect them
+# without having to evaluate conditional control flow.
+application = app
+handler = app
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_ORIGIN, "http://127.0.0.1:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+def root():
+    if DATABASE_URL:
+        return {"service": "evently-backend", "status": "running"}
+    return {
+        "service": "evently-backend",
+        "status": "not-configured",
+        "detail": "Set DATABASE_URL in Vercel to enable the FastAPI backend.",
+    }
+
+
+@app.get("/health")
+def health():
+    if DATABASE_URL:
+        return {"status": "ok", "configured": True}
+    return {
+        "status": "not-configured",
+        "configured": False,
+        "detail": "DATABASE_URL is not configured.",
+    }
 
 
 if not DATABASE_URL:
-    app = FastAPI(
-        title="Evently Backend",
-        description="Fallback backend entrypoint for Vercel deployments without database configuration.",
-        version="1.0.0",
-    )
-    add_cors(app)
-
-    @app.get("/")
-    def root():
-        return {
-            "service": "evently-backend",
-            "status": "not-configured",
-            "detail": "Set DATABASE_URL in Vercel to enable the FastAPI backend.",
-        }
-
-    @app.get("/health")
-    def health():
-        return {
-            "status": "not-configured",
-            "configured": False,
-            "detail": "DATABASE_URL is not configured.",
-        }
 
     @app.api_route("/{path:path}", methods=REQUEST_METHODS, include_in_schema=False)
     async def backend_not_configured(path: str):
@@ -83,6 +93,7 @@ if not DATABASE_URL:
             },
             status_code=503,
         )
+
 else:
     from attendee_service import models as attendee_models  # noqa: F401
     from attendee_service.routes import router as attendee_router
@@ -97,30 +108,13 @@ else:
     from user_service import models as user_models  # noqa: F401
     from user_service.routes import router as user_router
 
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI):
+    @app.on_event("startup")
+    async def startup_event():
         Base.metadata.create_all(bind=engine)
         ensure_schema_backfill()
-        yield
-
-    app = FastAPI(
-        title="Evently Backend",
-        description="Aggregated FastAPI backend for Vercel multi-service deployments.",
-        version="1.0.0",
-        lifespan=lifespan,
-    )
-    add_cors(app)
 
     app.include_router(user_router, prefix="/api/users", tags=["Users"])
     app.include_router(event_router, prefix="/api/events", tags=["Events"])
     app.include_router(ticket_router, prefix="/api/tickets", tags=["Tickets"])
     app.include_router(payment_router, prefix="/api/payments", tags=["Payments"])
     app.include_router(attendee_router, prefix="/api/attendees", tags=["Attendees"])
-
-    @app.get("/")
-    def root():
-        return {"service": "evently-backend", "status": "running"}
-
-    @app.get("/health")
-    def health():
-        return {"status": "ok", "configured": True}
